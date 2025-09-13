@@ -1,3 +1,9 @@
+"""
+Hybrid MSE+MAE Loss with Age-Range Constraint for Brain Age Regression
+
+@author: Puzhen & Ruijia
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

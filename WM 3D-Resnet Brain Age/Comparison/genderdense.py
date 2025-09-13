@@ -1,3 +1,9 @@
+"""
+3D DenseNet dMRI (FA/MD/MO) Pipeline for White Matter Brain Age 
+
+@author: Puzhen & Ruijia
+"""
+
 import os
 import pandas as pd
 import nibabel as nib

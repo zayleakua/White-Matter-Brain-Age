@@ -1,3 +1,9 @@
+"""
+White Matter Brain Age — 3D ResNet Training Pipeline (FA/MD/MO + Sex) with AdamW, CosineAnnealing, and Range-Constrained MSE/MAE Loss
+
+@author: Puzhen & Ruijia
+"""
+
 import os
 import pandas as pd
 import nibabel as nib
