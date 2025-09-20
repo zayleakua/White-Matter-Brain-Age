@@ -1,3 +1,9 @@
+"""
+Custom Loss: Combined MSE + MAE with Range Constraint for Age Prediction
+
+@author: Puzhen & Ruijia
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

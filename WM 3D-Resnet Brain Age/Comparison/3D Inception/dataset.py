@@ -1,3 +1,9 @@
+"""
+Multimodal 3D dMRI (FA/MD/MO) Dataset & Augmentation for White Matter Brain Age (with Sex Metadata)
+
+@author: Puzhen & Ruijia
+"""
+
 import os
 import pandas as pd
 import numpy as np

@@ -1,3 +1,9 @@
+"""
+White Matter Brain Age — 3D DenseNet Training Pipeline (FA/MD/MO + Sex) with AdamW, CosineAnnealingLR, and Combined MSE/MAE Loss + Range Constraint
+
+@author: Puzhen & Ruijia
+"""
+
 import os, random
 import numpy as np
 import pandas as pd
