@@ -1,0 +1,7 @@
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.11.4
+nibabel
+scikit-learn
+tqdm
+torch==2.3.1
