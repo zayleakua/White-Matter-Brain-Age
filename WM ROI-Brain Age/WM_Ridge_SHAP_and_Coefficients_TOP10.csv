@@ -1,0 +1,11 @@
+Feature,Mean_ABS_SHAP_Value,Coefficient
+Pontine Crossing Tract – Neurite Density Index,1.085905681917439,-1.2608228897663978
+Pontine Crossing Tract – Axial Kurtosis,1.0443751340220782,-1.2723762384332953
+Right Cerebral Peduncle – Fractional Anisotropy,0.9922059318790776,-1.2803426326392124
+Left Posterior Corona Radiata – Axial Kurtosis,0.9688505058436613,-1.105238270523717
+Right Superior Cerebellar Peduncle – Axial Kurtosis,0.9005436087878705,-1.2366556706695535
+Splenium Of Corpus Callosum – Free Water Fraction,0.8455357267588419,1.0219384600008372
+Right External Capsule – Mean Signal Kurtosis,0.8406200776993702,1.0123788033126644
+Right Posterior Thalamic Radiation – Axial Kurtosis,0.8183936322995229,-0.9370526909293606
+Sagittal Stratum – Free Water Fraction,0.7701024187360929,0.897076919563049
+Left Retrolenticular Part Of Internal Capsule – Fractional Anisotropy,0.7551620849584029,-0.835867271032074
