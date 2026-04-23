@@ -1,492 +1,655 @@
-############################################################
-## sem_pipeline.R
-## SEM pipeline for:
-##  (1) Main mediation: risk_10y → WMBAG → Speed / Fluid_Intelligence
-##  (2) Sex-moderated mediation (multi-group by Sex)
-##  (3) Single VRF → WMBAG → cognition (with FDR)
-############################################################
-
+## ====================== 0. LOAD PACKAGES ======================
+library(psych)
+library(ggplot2)
+library(GGally)
+library(corrplot)
+library(semPlot)
 library(lavaan)
 library(dplyr)
+library(semTools)
+library(purrr)
 
 set.seed(42)
 
-## ====================== 0. Paths & data ======================
-
-data_path <- "data/WMBAG_data.csv"   
-out_dir   <- "results"
+## ====================== 1. SETUP ======================
+data_path <- "/Users/zayleazhongjiekua/Documents/camCAN/manuscript/WMBAG_data.csv"
+out_dir   <- "/Users/zayleazhongjiekua/Documents/camCAN/out"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
-df <- read.csv(data_path, stringsAsFactors = FALSE)
+cat("================================================================================\n")
+cat("COMBINED SEM ANALYSIS\n")
+cat("Part 1: Primary SEM with Latent Speed Factor\n")
+cat("Part 2: Individual Risk Factor Models (Parallel Mediation)\n")
+cat("Primary model: age + sex adjusted for both mediators and outcome\n")
+cat("Bootstrap: 5000 iterations with BCa confidence intervals\n")
+cat("================================================================================\n\n")
 
-## ---- shared columns / checks ----
-need_core <- c("WMBAG","speed","fluid_intelligence","age","sex","education","risk_10y")
-stopifnot(all(need_core %in% names(df)))
+## ====================== HELPER FUNCTIONS ======================
 
-has_GMBAG <- "GMBAG" %in% names(df)
+get_fit_df <- function(fit, model_label) {
+  fm <- fitMeasures(fit,
+                    c("chisq", "df", "pvalue", "cfi", "tli",
+                      "rmsea", "rmsea.ci.lower", "rmsea.ci.upper",
+                      "rmsea.pvalue", "srmr", "npar", "ntotal"))
+  data.frame(Model     = model_label,
+             Index     = names(fm),
+             Value     = as.numeric(fm),
+             row.names = NULL)
+}
 
-# Risk per 10%-points (risk_10y is in %)
-df$risk10_per10 <- as.numeric(df$risk_10y) / 10
+zscore <- function(x) as.numeric(scale(x))
 
-# Education factor + treatment dummies (Secondary ref)
-df$Education_f <- factor(df$education,
-                         levels = c(0, 1, 2),
-                         labels = c("Secondary", "PreU", "Degree"))
-MM <- model.matrix(~ Education_f, data = df)
-df$Edu_PreU   <- as.numeric(MM[, "Education_fPreU"])
-df$Edu_Degree <- as.numeric(MM[, "Education_fDegree"])
+## ====================== 2. LOAD DATA ======================
 
-# SexGrp factor for multi-group models (0 = Male, 1 = Female)
-sx <- df$sex
+mydata <- read.csv(data_path, stringsAsFactors = FALSE)
+
+## ---- Required columns ----
+need_core <- c("WMBAG", "GMBAG", "age", "sex", "risk_10y", "education", "BMI",
+               "RTsimple_RTtrim3mean", "RTsimple_RTsd",
+               "RTchoice_RTtrim3mean_all", "RTchoice_RTsd_all")
+missing_cols <- need_core[!need_core %in% names(mydata)]
+if (length(missing_cols) > 0) {
+  cat("WARNING: Missing columns:", paste(missing_cols, collapse = ", "), "\n")
+  cat("Please check that column names are correct (e.g., 'WMBAG' not 'Ridge_WMBAG')\n\n")
+}
+
+stopifnot(all(need_core[need_core %in% names(mydata)] %in% names(mydata)))
+
+cat("Sample size (total):", nrow(mydata), "\n\n")
+
+## ====================== 3. PREPARE REACTION TIME VARIABLES ======================
+
+mydata$RTsimple_RTsd[mydata$RTsimple_RTsd == 0]         <- NA
+mydata$RTchoice_RTsd_all[mydata$RTchoice_RTsd_all == 0] <- NA
+
+mydata$RTsimple_RTtrim3mean_log         <- log(mydata$RTsimple_RTtrim3mean)
+mydata$RTsimple_RTsd_log                <- log(mydata$RTsimple_RTsd)
+mydata$RTchoice_RTtrim3mean_all_log     <- log(mydata$RTchoice_RTtrim3mean_all)
+mydata$RTchoice_RTsd_all_log            <- log(mydata$RTchoice_RTsd_all)
+
+mydata$RTsimple_RTtrim3mean_log_inv     <- -1 * mydata$RTsimple_RTtrim3mean_log
+mydata$RTsimple_RTsd_log_inv            <- -1 * mydata$RTsimple_RTsd_log
+mydata$RTchoice_RTtrim3mean_all_log_inv <- -1 * mydata$RTchoice_RTtrim3mean_all_log
+mydata$RTchoice_RTsd_all_log_inv        <- -1 * mydata$RTchoice_RTsd_all_log
+
+## ====================== 4. DATA PREPARATION ======================
+
+mydata$risk10_per10 <- as.numeric(mydata$risk_10y) / 10
+
+sx <- mydata$sex
 if (is.numeric(sx)) {
-  if (!all(sx %in% c(0,1), na.rm = TRUE)) {
-    u <- sort(unique(na.omit(sx)))
+  if (!all(sx %in% c(0, 1), na.rm = TRUE)) {
+    u  <- sort(unique(na.omit(sx)))
     sx <- ifelse(is.na(sx), NA, ifelse(sx == u[1], 0L, 1L))
   }
 } else {
-  low <- tolower(as.character(sx))
-  sx <- ifelse(grepl("\\bfemale\\b", low), 1L,
-               ifelse(grepl("\\bmale\\b",   low), 0L, NA))
+  low <- tolower(trimws(as.character(sx)))
+  sx  <- ifelse(grepl("\\bfemale\\b", low), 1L,
+                ifelse(grepl("\\bmale\\b", low), 0L, NA))
 }
-df$SexGrp <- factor(ifelse(sx == 0, "Male", "Female"),
-                    levels = c("Male","Female"))
+mydata$sex01 <- as.numeric(sx)
 
-cat("Sex coding check (0=Male, 1=Female):\n")
-print(table(SexNumeric = sx, SexGrp = df$SexGrp, useNA = "ifany"))
-
-
-############################################################
-## (1) MAIN MEDIATION MODELS:
-##     risk10_per10 → WMBAG → Speed / LCF2
-############################################################
-
-run_main_outcome <- function(df, outcome_var) {
-  predictor <- "risk10_per10"
-  mediator  <- "WMBAG"
-  has_GMBAG <- "GMBAG" %in% names(df)
-  
-  covs_A <- c("age","sex","Edu_PreU","Edu_Degree")
-  covs_B <- if (has_GMBAG) c(covs_A, "GMBAG") else covs_A
-  
-  cov_str <- function(x) paste(x, collapse = " + ")
-  
-  model_string <- function(covs) {
-    paste0(
-      mediator, " ~ a*", predictor, " + ", cov_str(covs), "\n",
-      outcome_var, " ~ b*", mediator, " + cp*", predictor, " + ", cov_str(covs), "\n",
-      "indirect := a*b\n",
-      "total    := cp + a*b\n",
-      "pm       := 100*(a*b)/(cp + a*b)\n"
-    )
-  }
-  
-  model_A <- model_string(covs_A)
-  model_B <- model_string(covs_B)
-  
-  need_A <- c(mediator, outcome_var, predictor, covs_A)
-  dA <- df %>%
-    dplyr::select(dplyr::all_of(need_A)) %>%
-    dplyr::filter(complete.cases(.))
-  
-  if (has_GMBAG) {
-    need_B <- c(mediator, outcome_var, predictor, covs_B)
-    dB <- df %>%
-      dplyr::select(dplyr::all_of(need_B)) %>%
-      dplyr::filter(complete.cases(.))
-  }
-  
-  fit_A <- sem(model_A, data = dA, se = "bootstrap", bootstrap = 5000,
-               meanstructure = TRUE, fixed.x = TRUE)
-  if (has_GMBAG) {
-    fit_B <- sem(model_B, data = dB, se = "bootstrap", bootstrap = 5000,
-                 meanstructure = TRUE, fixed.x = TRUE)
-  }
-  
-  pull_keys <- function(fit, model_label) {
-    parameterEstimates(fit, ci = TRUE, level = 0.95,
-                       boot.ci.type = "bca.simple",
-                       standardized = FALSE) %>%
-      dplyr::filter(label %in% c("a","b","cp","indirect","total","pm")) %>%
-      dplyr::transmute(
-        Model    = model_label,
-        Outcome  = outcome_var,
-        Path     = dplyr::case_when(
-          label == "a"        ~ "a (risk_10y→WMBAG)",
-          label == "b"        ~ paste0("b (WMBAG→", outcome_var, ")"),
-          label == "cp"       ~ paste0("c' (risk_10y→", outcome_var, ")"),
-          label == "indirect" ~ "indirect (a*b)",
-          label == "total"    ~ "total",
-          label == "pm"       ~ "% mediated"
-        ),
-        Effect   = est,
-        SE       = se,
-        CI_lower = ci.lower,
-        CI_upper = ci.upper,
-        p_value  = pvalue
-      )
-  }
-  
-  pe_A <- pull_keys(fit_A, "age+sex+Education_f (Secondary ref)")
-  pe_B <- if (has_GMBAG)
-    pull_keys(fit_B, "age+sex+Education_f+GMBAG") else NULL
-  
-  res <- dplyr::bind_rows(pe_A, pe_B) %>%
-    dplyr::mutate(
-      dplyr::across(c(Effect, SE, CI_lower, CI_upper), ~ round(., 3)),
-      p_value = signif(p_value, 6)
-    )
-  
-  attr(res, "N_A") <- nrow(dA)
-  if (has_GMBAG) attr(res, "N_B") <- nrow(dB)
-  
-  res
-}
-
-run_main_mediation <- function(df, out_file) {
-  outcomes <- c("speed","fluid_intelligence")
-  all_results <- dplyr::bind_rows(
-    lapply(outcomes, run_main_outcome, df = df)
+if (!is.numeric(mydata$education)) {
+  edu_chr <- trimws(tolower(as.character(mydata$education)))
+  mydata$edu_ord <- dplyr::case_when(
+    edu_chr %in% c("secondary") ~ 0,
+    edu_chr %in% c("preu", "pre-u", "pre u", "junior college", "jc") ~ 1,
+    edu_chr %in% c("degree", "university", "bachelor", "bachelors") ~ 2,
+    TRUE ~ NA_real_
   )
-  write.csv(all_results, out_file, row.names = FALSE)
-  cat("Main mediation results saved to:", out_file, "\n")
-}
-
-main_out_csv <- file.path(
-  out_dir,
-  "sem_mediation_risk_WMBAG_Speed_FluidIntelligence.csv"
-)
-run_main_mediation(df, main_out_csv)
-
-
-############################################################
-## (2) SEX-MODERATED MEDIATION (multi-group by SexGrp)
-##     risk10_per10 → WMBAG → speed / fluid_intelligence
-##     Only LRT (χ²) tests, no Wald tests
-############################################################
-
-cov_tail_M1 <- " + age + Edu_PreU + Edu_Degree"
-cov_tail_M2 <- paste0(cov_tail_M1, " + GMBAG")
-
-make_model_unconstrained <- function(Y, cov_tail) {
-  paste0(
-    "WMBAG ~ c(a_m, a_f)*risk10_per10", cov_tail, "\n",
-    Y,     " ~ c(b_m, b_f)*WMBAG + c(cp_m, cp_f)*risk10_per10", cov_tail, "\n",
-    "ind_m := a_m*b_m\n",
-    "ind_f := a_f*b_f\n",
-    "diff_ind := ind_m - ind_f\n",
-    "total_m := cp_m + ind_m\n",
-    "total_f := cp_f + ind_f\n"
-  )
-}
-
-make_model_constrain_a  <- function(Y, cov_tail)
-  paste0(
-    "WMBAG ~ c(a, a)*risk10_per10", cov_tail, "\n",
-    Y,     " ~ c(b_m, b_f)*WMBAG + c(cp_m, cp_f)*risk10_per10", cov_tail, "\n"
-  )
-
-make_model_constrain_b  <- function(Y, cov_tail)
-  paste0(
-    "WMBAG ~ c(a_m, a_f)*risk10_per10", cov_tail, "\n",
-    Y,     " ~ c(b, b)*WMBAG + c(cp_m, cp_f)*risk10_per10", cov_tail, "\n"
-  )
-
-make_model_constrain_cp <- function(Y, cov_tail)
-  paste0(
-    "WMBAG ~ c(a_m, a_f)*risk10_per10", cov_tail, "\n",
-    Y,     " ~ c(b_m, b_f)*WMBAG + c(cp, cp)*risk10_per10", cov_tail, "\n"
-  )
-
-run_mg_outcome <- function(df, Y, cov_tail, include_gmbag = FALSE, boot_R = 5000) {
-  need <- c("risk10_per10","WMBAG","age","Edu_PreU","Edu_Degree","SexGrp",Y)
-  if (include_gmbag) need <- c(need, "GMBAG")
-  d <- df[, need]
-  d <- d[complete.cases(d), , drop = FALSE]
-  
-  # Unconstrained model for bootstrap estimates
-  mod_un   <- make_model_unconstrained(Y, cov_tail)
-  fit_boot <- sem(mod_un, data = d, group = "SexGrp",
-                  se = "bootstrap", bootstrap = boot_R,
-                  meanstructure = TRUE)
-  pe_boot  <- parameterEstimates(fit_boot, ci = TRUE, level = 0.95,
-                                 boot.ci.type = "bca.simple",
-                                 standardized = FALSE)
-  
-  # Indirects + totals by sex
-  defs_boot <- pe_boot %>%
-    dplyr::filter(op == ":=",
-                  lhs %in% c("ind_m","ind_f","diff_ind","total_m","total_f")) %>%
-    dplyr::transmute(
-      Outcome = Y, Param = lhs, Est = est, SE = se,
-      CI_low = ci.lower, CI_high = ci.upper, p = pvalue
-    )
-  
-  # a_m/a_f, b_m/b_f, cp_m/cp_f
-  abcp_boot <- pe_boot %>%
-    dplyr::filter(op == "~",
-                  lhs %in% c("WMBAG", Y),
-                  label %in% c("a_m","a_f","b_m","b_f","cp_m","cp_f")) %>%
-    dplyr::transmute(
-      Outcome = Y, Param = label, Est = est, SE = se,
-      CI_low = ci.lower, CI_high = ci.upper, p = pvalue
-    )
-  
-  # LRT (χ²) tests for equality of a, b, c'
-  fit_ml <- sem(mod_un, data = d, group = "SexGrp",
-                se = "standard", meanstructure = TRUE)
-  
-  fit_a  <- sem(make_model_constrain_a(Y,  cov_tail),
-                data = d, group = "SexGrp",
-                se = "standard", meanstructure = TRUE)
-  fit_b  <- sem(make_model_constrain_b(Y,  cov_tail),
-                data = d, group = "SexGrp",
-                se = "standard", meanstructure = TRUE)
-  fit_cp <- sem(make_model_constrain_cp(Y, cov_tail),
-                data = d, group = "SexGrp",
-                se = "standard", meanstructure = TRUE)
-  
-  lrt_a  <- anova(fit_ml, fit_a)
-  lrt_b  <- anova(fit_ml, fit_b)
-  lrt_cp <- anova(fit_ml, fit_cp)
-  
-  tidy_lrt <- function(anv, path_label) {
-    data.frame(
-      Outcome = Y,
-      Path    = path_label,
-      Df      = anv$Df,
-      AIC     = anv$AIC,
-      BIC     = anv$BIC,
-      Chisq   = anv$Chisq,
-      `Chisq diff` = c(NA, diff(anv$Chisq)),
-      `Df diff`    = c(NA, diff(anv$Df)),
-      `Pr(>Chisq)` = c(NA, pchisq(diff(anv$Chisq),
-                                  df = diff(anv$Df),
-                                  lower.tail = FALSE)),
-      check.names = FALSE
-    )
-  }
-  
-  lrt_tbl <- dplyr::bind_rows(
-    tidy_lrt(lrt_a,  "Equal a (risk10_per10→WMBAG)"),
-    tidy_lrt(lrt_b,  paste0("Equal b (WMBAG→", Y, ")")),
-    tidy_lrt(lrt_cp, paste0("Equal c' (risk10_per10→", Y, ")"))
-  )
-  
-  list(
-    outcome   = Y,
-    N         = nrow(d),
-    abcp_boot = abcp_boot,
-    defs_boot = defs_boot,
-    lrt_tbl   = lrt_tbl
-  )
-}
-
-run_mg_model <- function(df, model_label, cov_tail,
-                         include_gmbag, out_csv_path) {
-  cat("\n================ ", model_label, " ================\n", sep = "")
-  outcomes <- c("speed","fluid_intelligence")
-  res_list <- lapply(outcomes,
-                     function(Y) run_mg_outcome(df, Y, cov_tail, include_gmbag))
-  
-  # Save path estimates + defined effects
-  out_tab <- dplyr::bind_rows(
-    dplyr::bind_rows(lapply(res_list, `[[`, "abcp_boot")) %>%
-      dplyr::mutate(Table = "Paths_by_Sex_BootCI"),
-    dplyr::bind_rows(lapply(res_list, `[[`, "defs_boot")) %>%
-      dplyr::mutate(Table = "Indirects_Totals_BootCI")
-  )
-  write.csv(out_tab, out_csv_path, row.names = FALSE)
-  cat("Saved bootstrap path/indirect tables to:", out_csv_path, "\n")
-  
-  # Save LRT χ² tables only
-  lrt_all <- dplyr::bind_rows(lapply(res_list, `[[`, "lrt_tbl"))
-  lrt_file <- sub("\\.csv$", "_LRT.csv", out_csv_path)
-  write.csv(lrt_all, lrt_file, row.names = FALSE)
-  cat("Saved LRT (χ²) tests to:", lrt_file, "\n")
-}
-
-mg_out1 <- file.path(out_dir, "mg_mediation_WMBAG_sex_pathtest_MODEL1.csv")
-mg_out2 <- file.path(out_dir, "mg_mediation_WMBAG_sex_pathtest_MODEL2_GMBAG.csv")
-
-run_mg_model(df, "Model 1: age+education", cov_tail_M1,
-             include_gmbag = FALSE, out_csv_path = mg_out1)
-
-if (has_GMBAG) {
-  run_mg_model(df, "Model 2: age+education+GMBAG", cov_tail_M2,
-               include_gmbag = TRUE, out_csv_path = mg_out2)
 } else {
-  message("Skipping sex-MG Model 2: GMBAG not found in data.")
+  mydata$edu_ord <- as.numeric(mydata$education)
 }
 
+## ====================== 5. PREPARE INDIVIDUAL RISK FACTORS ======================
+## NOTE: Diabetes excluded from analysis.
+## Models run for hypertension, obesity, and smoking only.
+## Bonferroni correction applied across 3 tests.
 
+## ---- Obesity: BMI >= 30 (WHO definition) ----
+mydata$obesity <- ifelse(is.na(mydata$BMI), NA,
+                         ifelse(mydata$BMI >= 30, 1L, 0L))
 
-############################################################
-## (3) SINGLE-VRF MEDIATION:
-##     Hypertension / Smoking / Diabetes → WMBAG → speed / fluid_intelligence
-##     (with FDR for indirect effects)
-############################################################
+cat("Obesity prevalence:\n")
+print(table(mydata$obesity, useNA = "ifany"))
+cat("\n")
 
-run_single_vrf_mediation <- function(df, out_file) {
-  has_GMBAG <- "GMBAG" %in% names(df)
-  
-  # Three VRFs:
-  risk_factors <- c(
-    Hypertension = "hypertension",  # 0/1
-    Smoking      = "smoking",       # 0/1
-    Diabetes     = "diabetes"       # 0/1
-  )
-  risk_factors <- risk_factors[risk_factors %in% names(df)]
-  stopifnot(length(risk_factors) > 0)
-  
-  # Coercions
-  df$age   <- as.numeric(df$age)
-  df$sex   <- as.integer(df$sex)  # 0/1
-  df$speed <- as.numeric(df$speed)
-  df$fluid_intelligence <- as.numeric(df$fluid_intelligence)
-  df$WMBAG <- as.numeric(df$WMBAG)
-  if (has_GMBAG) df$GMBAG <- as.numeric(df$GMBAG)
-  
-  # Ensure VRFs are 0/1
-  to01 <- function(x) {
-    x <- as.numeric(x)
-    ifelse(is.na(x), NA, ifelse(x != 0, 1, 0))
-  }
-  for (nm in c("hypertension","smoking","diabetes")) {
-    if (nm %in% names(df)) df[[nm]] <- to01(df[[nm]])
-  }
-  
-  make_model <- function(Y, P, covars) {
-    paste0(
-      "WMBAG ~ a*", P, " + ", paste(covars, collapse=" + "), "\n",
-      Y,     " ~ b*WMBAG + cp*", P, " + ", paste(covars, collapse=" + "), "\n",
-      "indirect := a*b\n",
-      "total    := cp + a*b\n"
-    )
-  }
-  
-  fit_sem <- function(dsub, model_string, boot_R=5000) {
-    sem(model_string, data=dsub, se="bootstrap", bootstrap=boot_R,
-        meanstructure=TRUE, fixed.x=TRUE)
-  }
-  
-  pull_defs <- function(fit, model_label, outcome_label, predictor_label) {
-    parameterEstimates(fit, ci=TRUE, level=0.95,
-                       boot.ci.type="perc",
-                       standardized=FALSE) %>%
-      dplyr::filter(op==":=", lhs %in% c("indirect","total")) %>%
-      dplyr::transmute(
-        Model     = model_label,
-        Outcome   = outcome_label,
-        Predictor = predictor_label,
-        Path      = lhs,   # "indirect" or "total"
-        Effect    = est,
-        SE        = se,
-        CI_lower  = ci.lower,
-        CI_upper  = ci.upper,
-        p_value   = pvalue
-      )
-  }
-  
-  pull_paths <- function(fit, model_label, outcome_label, predictor_label) {
-    parameterEstimates(fit, ci=TRUE, level=0.95,
-                       boot.ci.type="bca.simple",
-                       standardized=FALSE) %>%
-      dplyr::filter(label %in% c("a","b","cp")) %>%
-      dplyr::transmute(
-        Model     = model_label,
-        Outcome   = outcome_label,
-        Predictor = predictor_label,
-        Path      = dplyr::case_when(
-          label=="a"  ~ paste0("a (", predictor_label,"→WMBAG)"),
-          label=="b"  ~ paste0("b (WMBAG→", outcome_label, ")"),
-          label=="cp" ~ paste0("c' (", predictor_label,"→", outcome_label, ")")
-        ),
-        Effect    = est,
-        SE        = se,
-        CI_lower  = ci.lower,
-        CI_upper  = ci.upper,
-        p_value   = pvalue
-      )
-  }
-  
-  outcomes <- c("speed","fluid_intelligence")
-  all_rows <- list()
-  
-  for (pred_label in names(risk_factors)) {
-    P_col <- risk_factors[[pred_label]]
-    P <- P_col  # no SBP or other transformations now
-    
-    for (Y in outcomes) {
-      covs_M1 <- c("age","sex","Edu_PreU","Edu_Degree")
-      covs_M2 <- if (has_GMBAG) c(covs_M1, "GMBAG") else covs_M1
-      
-      need1 <- c("WMBAG", Y, P, covs_M1)
-      d1 <- df[, need1, drop=FALSE] %>% dplyr::filter(complete.cases(.))
-      need2 <- c("WMBAG", Y, P, covs_M2)
-      d2 <- df[, need2, drop=FALSE] %>% dplyr::filter(complete.cases(.))
-      
-      mod1 <- make_model(Y, P, covs_M1)
-      mod2 <- make_model(Y, P, covs_M2)
-      
-      fit1 <- fit_sem(d1, mod1, boot_R=5000)
-      fit2 <- fit_sem(d2, mod2, boot_R=5000)
-      
-      tab1 <- dplyr::bind_rows(
-        pull_paths(fit1, "Model 1: age+sex+education", Y, pred_label),
-        pull_defs(fit1,  "Model 1: age+sex+education", Y, pred_label)
-      ) %>% dplyr::mutate(N = nrow(d1))
-      
-      tab2 <- dplyr::bind_rows(
-        pull_paths(fit2, "Model 2: +GMBAG", Y, pred_label),
-        pull_defs(fit2,  "Model 2: +GMBAG", Y, pred_label)
-      ) %>% dplyr::mutate(N = nrow(d2))
-      
-      all_rows[[length(all_rows)+1]] <- dplyr::bind_rows(tab1, tab2)
-    }
-  }
-  
-  results <- dplyr::bind_rows(all_rows) %>%
-    dplyr::mutate(
-      dplyr::across(c(Effect, SE, CI_lower, CI_upper), ~ round(., 3)),
-      p_value = signif(p_value, 6)
-    )
-  
-  # FDR across ALL indirect effects (a*b)
-  is_indirect <- results$Path == "indirect"
-  results$FDR_q_indirect_all <- NA_real_
-  if (any(is_indirect, na.rm = TRUE)) {
-    results$FDR_q_indirect_all[is_indirect] <-
-      p.adjust(results$p_value[is_indirect], method = "BH")
-  }
-  
-  # Optional: FDR within Outcome × Model for indirects
-  results$FDR_q_indirect_byModel <- NA_real_
-  if (any(is_indirect, na.rm = TRUE)) {
-    results <- results %>%
-      dplyr::group_by(Outcome, Model) %>%
-      dplyr::mutate(FDR_q_indirect_byModel = ifelse(
-        Path == "indirect",
-        p.adjust(p_value, method = "BH"),
-        NA_real_
-      )) %>%
-      dplyr::ungroup()
-  }
-  
-  fmt_p <- function(x) ifelse(is.na(x), NA_character_,
-                              ifelse(x < 0.001, "<0.001", sprintf("%.3f", x)))
-  results <- results %>%
-    dplyr::mutate(
-      p_fmt   = fmt_p(p_value),
-      q_all   = fmt_p(FDR_q_indirect_all),
-      q_byMod = fmt_p(FDR_q_indirect_byModel)
-    )
-  
-  write.csv(results, out_file, row.names = FALSE)
-  cat("\nSingle-VRF mediation (with FDR) saved to:", out_file, "\n")
+if ("hypertension" %in% names(mydata)) {
+  cat("Hypertension prevalence:\n")
+  print(table(mydata$hypertension, useNA = "ifany"))
+  cat("\n")
 }
 
-vrf_out_csv <- file.path(
-  out_dir,
-  "sem_by_riskfactor_mediation.csv"
+if ("smoking" %in% names(mydata)) {
+  cat("Smoking prevalence:\n")
+  print(table(mydata$smoking, useNA = "ifany"))
+  cat("\n")
+}
+
+## ====================== 6. Z-SCORE VARIABLES ======================
+
+mydata$risk10_z <- zscore(mydata$risk10_per10)
+mydata$WMBAG_z <- zscore(mydata$WMBAG)
+mydata$GMBAG_z       <- zscore(mydata$GMBAG)
+
+# z-score RT indicators after log + inversion, before CFA
+mydata$RTsimple_RTtrim3mean_z     <- zscore(mydata$RTsimple_RTtrim3mean_log_inv)
+mydata$RTsimple_RTsd_z            <- zscore(mydata$RTsimple_RTsd_log_inv)
+mydata$RTchoice_RTtrim3mean_all_z <- zscore(mydata$RTchoice_RTtrim3mean_all_log_inv)
+mydata$RTchoice_RTsd_all_z        <- zscore(mydata$RTchoice_RTsd_all_log_inv)
+
+## ====================== 7. ANALYSIS DATASET ======================
+
+need_vars <- c("risk10_z", "WMBAG_z", "GMBAG_z", "age", "sex01",
+               "RTsimple_RTtrim3mean_z", "RTsimple_RTsd_z",
+               "RTchoice_RTtrim3mean_all_z", "RTchoice_RTsd_all_z",
+               "obesity")
+
+need_vars_rf <- c(need_vars, "hypertension", "smoking")
+need_vars_rf <- need_vars_rf[need_vars_rf %in% names(mydata)]
+
+d_sem <- mydata %>%
+  dplyr::select(dplyr::all_of(need_vars_rf))
+
+cat("Number of complete cases across all SEM variables:", sum(complete.cases(d_sem)), "\n")
+cat("SEM estimation uses FIML with fixed.x = FALSE\n\n")
+
+## ====================== 8. PRIMARY SEM MODEL ======================
+
+cat("================================================================================\n")
+cat("PART 1: PRIMARY SEM - PARALLEL MEDIATION WITH CV RISK\n")
+cat("================================================================================\n\n")
+
+primary_sem_model <- '
+  # ---- Measurement model ----
+  Speed_latent =~ RTsimple_RTtrim3mean_z + RTsimple_RTsd_z +
+                  RTchoice_RTtrim3mean_all_z + RTchoice_RTsd_all_z
+
+  # Residual covariances
+  RTsimple_RTtrim3mean_z ~~ RTsimple_RTsd_z
+  RTchoice_RTtrim3mean_all_z ~~ RTchoice_RTsd_all_z
+  RTsimple_RTtrim3mean_z ~~ RTchoice_RTtrim3mean_all_z
+
+  # ---- Mediators ----
+  WMBAG_z ~ a_w*risk10_z + age + sex01
+  GMBAG_z       ~ a_g*risk10_z + age + sex01
+
+  # Residual covariance between mediators
+  WMBAG_z ~~ GMBAG_z
+
+  # ---- Outcome ----
+  Speed_latent ~ b_w*WMBAG_z + b_g*GMBAG_z + cp*risk10_z + age + sex01
+
+  # ---- Indirect effects ----
+  ind_w    := a_w * b_w
+  ind_g    := a_g * b_g
+  ind_diff := ind_w - ind_g
+  total    := cp + ind_w + ind_g
+
+  # ---- Percent mediated ----
+  pm_total := 100 * (ind_w + ind_g) / total
+  pm_wm    := 100 * ind_w / total
+  pm_gm    := 100 * ind_g / total
+'
+
+cat("Fitting primary SEM with bootstrap (5000 iterations)...\n")
+fit_primary <- sem(
+  primary_sem_model,
+  data      = d_sem,
+  estimator = "ML",
+  missing   = "fiml",
+  fixed.x   = FALSE,
+  se        = "bootstrap",
+  bootstrap = 5000
 )
-run_single_vrf_mediation(df, vrf_out_csv)
+cat("✓ Primary SEM fitting complete\n\n")
+
+## ====================== 9. EXTRACT PRIMARY SEM RESULTS ======================
+
+pe_primary <- parameterEstimates(
+  fit_primary,
+  ci           = TRUE,
+  level        = 0.95,
+  boot.ci.type = "bca",
+  standardized = TRUE
+)
+
+primary_results <- pe_primary %>%
+  dplyr::filter(
+    label %in% c("a_w", "a_g", "b_w", "b_g", "cp") |
+      (op == ":=" & lhs %in% c("ind_w", "ind_g", "ind_diff", "total",
+                               "pm_total", "pm_wm", "pm_gm")) |
+      (op == "~~" & lhs == "WMBAG_z" & rhs == "GMBAG_z")
+  ) %>%
+  dplyr::mutate(
+    Path = dplyr::case_when(
+      label == "a_w"         ~ "a_w (risk -> WMBAG)",
+      label == "a_g"         ~ "a_g (risk -> GMBAG)",
+      label == "b_w"         ~ "b_w (WMBAG -> Speed)",
+      label == "b_g"         ~ "b_g (GMBAG -> Speed)",
+      label == "cp"          ~ "c' (direct: risk -> Speed)",
+      lhs == "ind_w"         ~ "Indirect: White Matter",
+      lhs == "ind_g"         ~ "Indirect: Grey Matter",
+      lhs == "ind_diff"      ~ "Difference: WM - GM",
+      lhs == "total"         ~ "Total effect",
+      lhs == "pm_total"      ~ "% mediated (total)",
+      lhs == "pm_wm"         ~ "% mediated (WM only)",
+      lhs == "pm_gm"         ~ "% mediated (GM only)",
+      lhs == "WMBAG_z"       ~ "Correlation: WMBAG ~~ GMBAG",
+      TRUE ~ paste(lhs, op, rhs)
+    ),
+    Significant_CI = ifelse(ci.lower > 0 | ci.upper < 0, "Yes", "No")
+  ) %>%
+  dplyr::select(Path, est, se, z, pvalue, ci.lower, ci.upper, std.all, Significant_CI)
+
+write.csv(
+  primary_results,
+  file.path(out_dir, "Primary_SEM_CV_risk_key_paths.csv"),
+  row.names = FALSE
+)
+
+primary_fit <- get_fit_df(fit_primary, "Primary SEM - CV Risk")
+
+write.csv(
+  primary_fit,
+  file.path(out_dir, "Primary_SEM_CV_risk_fit_indices.csv"),
+  row.names = FALSE
+)
+
+writeLines(
+  capture.output(
+    summary(
+      fit_primary,
+      ci = TRUE,
+      standardized = TRUE,
+      fit.measures = TRUE,
+      rsquare = TRUE,
+      fm.args = list(robust = FALSE)
+    )
+  ),
+  con = file.path(out_dir, "Primary_SEM_CV_risk_lavaan_summary.txt")
+)
+
+cat("Primary SEM Fit Indices:\n")
+print(primary_fit)
+cat("\n")
+
+## ====================== 10. CREATE PATH DIAGRAM FOR PRIMARY SEM ======================
+
+cat("Creating primary SEM path diagram...\n")
+
+png(
+  filename = file.path(out_dir, "Primary_SEM_CV_risk_path_diagram.png"),
+  width = 2600, height = 1800, res = 220
+)
+
+semPaths(
+  fit_primary,
+  what = "std",
+  whatLabels = "std",
+  style = "lisrel",
+  layout = "tree2",
+  rotation = 2,
+  residuals = FALSE,
+  intercepts = FALSE,
+  edge.label.cex = 0.9,
+  sizeMan = 7,
+  sizeLat = 10,
+  nCharNodes = 0,
+  mar = c(8, 8, 8, 8),
+  title = TRUE
+)
+
+title(main = "Primary SEM: Cardiovascular Risk", line = 2, cex.main = 1.2)
+
+dev.off()
+
+pdf(
+  file = file.path(out_dir, "Primary_SEM_CV_risk_path_diagram.pdf"),
+  width = 14, height = 10
+)
+
+semPaths(
+  fit_primary,
+  what = "std",
+  whatLabels = "std",
+  style = "lisrel",
+  layout = "tree2",
+  rotation = 2,
+  residuals = FALSE,
+  intercepts = FALSE,
+  edge.label.cex = 0.8,
+  sizeMan = 7,
+  sizeLat = 10,
+  nCharNodes = 0,
+  mar = c(8, 8, 8, 8),
+  title = TRUE
+)
+
+title(main = "Primary SEM: Cardiovascular Risk", line = 2, cex.main = 1.2)
+
+dev.off()
+
+cat("✓ Primary SEM path diagrams created\n\n")
+
+## ====================== 11. INDIVIDUAL RISK FACTOR MODEL BUILDER ======================
+
+build_parallel_model <- function(risk_factor) {
+
+  model <- paste0(
+    '
+  # ---- Measurement model ----
+  Speed_latent =~ RTsimple_RTtrim3mean_z + RTsimple_RTsd_z +
+                  RTchoice_RTtrim3mean_all_z + RTchoice_RTsd_all_z
+
+  # Correlated residuals within and across tasks
+  RTsimple_RTtrim3mean_z     ~~ RTsimple_RTsd_z
+  RTchoice_RTtrim3mean_all_z ~~ RTchoice_RTsd_all_z
+  RTsimple_RTtrim3mean_z     ~~ RTchoice_RTtrim3mean_all_z
+
+  # ---- Mediators (covariates: age, sex) ----
+  WMBAG_z ~ a_w*', risk_factor, ' + age + sex01
+  GMBAG_z       ~ a_g*', risk_factor, ' + age + sex01
+
+  # Residual covariance between mediators
+  WMBAG_z ~~ GMBAG_z
+
+  # ---- Outcome (covariates: age, sex) ----
+  Speed_latent ~ b_w*WMBAG_z + b_g*GMBAG_z +
+                 cp*', risk_factor, ' + age + sex01
+
+  # ---- Indirect effects ----
+  ind_w    := a_w * b_w
+  ind_g    := a_g * b_g
+  ind_diff := ind_w - ind_g
+  total    := cp + ind_w + ind_g
+  '
+  )
+  return(model)
+}
+
+## ====================== 12. INDIVIDUAL RISK FACTOR FIT FUNCTION ======================
+
+fit_parallel_mediator <- function(data, risk_factor, out_dir, n_tests = 3) {
+
+  cat("--------------------------------------------------------------------------------\n")
+  cat("Risk factor:", risk_factor, "\n")
+
+  ## ---- Bonferroni correction settings ----
+  alpha_bonf    <- 0.05 / n_tests
+  ci_level_bonf <- 1 - alpha_bonf
+
+  cat("  Bonferroni-adjusted alpha:", round(alpha_bonf, 5), "\n")
+  cat("  Bonferroni-adjusted CI level:", round(ci_level_bonf, 4), "\n")
+
+  ## ---- Handle missing data per risk factor ----
+  if (risk_factor == "hypertension") {
+    data_model <- data %>%
+      dplyr::filter(!is.na(.data[[risk_factor]]))
+    use_fiml <- FALSE
+    cat("  Listwise deletion for hypertension:",
+        nrow(data) - nrow(data_model), "cases removed\n")
+    cat("  N for this model:", nrow(data_model), "\n")
+  } else {
+    data_model <- data
+    use_fiml   <- TRUE
+    cat("  N for this model:", nrow(data_model), "\n")
+  }
+
+  model_syntax <- build_parallel_model(risk_factor)
+
+  ## ---- Fit model with 5000 bootstrap samples ----
+  fit <- suppressWarnings(
+    sem(
+      model_syntax,
+      data      = data_model,
+      estimator = "ML",
+      missing   = ifelse(use_fiml, "fiml", "listwise"),
+      fixed.x   = FALSE,
+      se        = "bootstrap",
+      bootstrap = 5000,
+      iseed     = 42
+    )
+  )
+
+  cat("  Model fitted successfully\n")
+
+  ## ---- Calculate alpha and CI level for standard (uncorrected) test ----
+  alpha_standard <- 0.05
+  ci_level_standard <- 1 - alpha_standard
+
+  ## ---- Extract parameter estimates with both CI levels ----
+  ## Standard 95% BCa CIs (uncorrected)
+  pe_95 <- parameterEstimates(
+    fit,
+    ci           = TRUE,
+    level        = ci_level_standard,
+    boot.ci.type = "bca",
+    standardized = TRUE
+  )
+
+  ## Bonferroni-adjusted BCa CIs (corrected for multiple comparisons)
+  pe_bonf <- parameterEstimates(
+    fit,
+    ci           = TRUE,
+    level        = ci_level_bonf,
+    boot.ci.type = "bca",
+    standardized = TRUE
+  )
+
+  ## ---- Merge both CI sets ----
+  pe <- pe_95 %>%
+    dplyr::left_join(
+      pe_bonf %>%
+        dplyr::select(
+          lhs, op, rhs, label,
+          ci.lower.bonf = ci.lower,
+          ci.upper.bonf = ci.upper
+        ),
+      by = c("lhs", "op", "rhs", "label")
+    )
+
+  ## ---- Extract key results ----
+  key_results <- pe %>%
+    dplyr::filter(
+      label %in% c("a_w", "a_g", "b_w", "b_g", "cp") |
+        (op == ":=" & lhs %in% c("ind_w", "ind_g", "ind_diff", "total")) |
+        (op == "~~" & lhs == "WMBAG_z" & rhs == "GMBAG_z")
+    ) %>%
+    dplyr::mutate(
+      Risk_Factor      = risk_factor,
+      N_model          = nrow(data_model),
+      Missing_handling = ifelse(
+        risk_factor == "hypertension",
+        "Listwise deletion (n=4 removed)",
+        "FIML"
+      ),
+      Path = dplyr::case_when(
+        label == "a_w"         ~ paste0("a_w (", risk_factor, " -> WMBAG)"),
+        label == "a_g"         ~ paste0("a_g (", risk_factor, " -> GMBAG)"),
+        label == "b_w"         ~ "b_w (WMBAG -> Speed)",
+        label == "b_g"         ~ "b_g (GMBAG -> Speed)",
+        label == "cp"          ~ paste0("c' (direct: ", risk_factor, " -> Speed)"),
+        lhs == "ind_w"         ~ "Indirect: White Matter",
+        lhs == "ind_g"         ~ "Indirect: Grey Matter",
+        lhs == "ind_diff"      ~ "Difference: WM - GM",
+        lhs == "total"         ~ "Total effect",
+        lhs == "WMBAG_z"       ~ "Correlation: WMBAG ~~ GMBAG",
+        TRUE ~ paste(lhs, op, rhs)
+      ),
+      Significant_CI = ifelse(ci.lower > 0 | ci.upper < 0, "Yes", "No"),
+      Survives_Bonferroni = ifelse(
+        ci.lower.bonf > 0 | ci.upper.bonf < 0,
+        "Yes",
+        "No"
+      )
+    ) %>%
+    dplyr::select(
+      Risk_Factor, N_model, Missing_handling, Path,
+      est, se, z, pvalue,
+      ci.lower, ci.upper,
+      ci.lower.bonf, ci.upper.bonf,
+      std.all, Significant_CI, Survives_Bonferroni
+    )
+
+  ## ---- Fit indices ----
+  fit_df <- get_fit_df(fit, risk_factor)
+
+  ## ---- Save outputs ----
+  safe_name <- gsub("[^A-Za-z0-9]+", "_", risk_factor)
+
+  write.csv(
+    key_results,
+    file.path(out_dir, paste0(safe_name, "_paths.csv")),
+    row.names = FALSE
+  )
+
+  write.csv(
+    fit_df,
+    file.path(out_dir, paste0(safe_name, "_fit_indices.csv")),
+    row.names = FALSE
+  )
+
+  writeLines(
+    capture.output(
+      summary(
+        fit, ci = TRUE, standardized = TRUE,
+        fit.measures = TRUE, rsquare = TRUE
+      )
+    ),
+    file.path(out_dir, paste0(safe_name, "_lavaan_summary.txt"))
+  )
+
+  cat("  Saved outputs for:", risk_factor, "\n")
+
+  return(list(
+    fit         = fit,
+    key_results = key_results,
+    fit_df      = fit_df
+  ))
+}
+
+## ====================== 13. RUN INDIVIDUAL RISK FACTOR MODELS ======================
+## NOTE: Diabetes excluded. Running for: hypertension, obesity, smoking
+
+cat("================================================================================\n")
+cat("PART 2: INDIVIDUAL RISK FACTOR MODELS - PARALLEL MEDIATION\n")
+cat("NOTE: Diabetes excluded from analysis.\n")
+cat("================================================================================\n\n")
+
+risk_factors <- c("hypertension", "obesity", "smoking")
+
+missing_rf <- risk_factors[!risk_factors %in% names(d_sem)]
+if (length(missing_rf) > 0) {
+  cat("WARNING: The following risk factors are missing from the data:\n")
+  cat("  ", paste(missing_rf, collapse = ", "), "\n")
+  cat("  Check column names with: names(mydata)\n\n")
+  risk_factors <- risk_factors[risk_factors %in% names(d_sem)]
+}
+
+n_tests <- length(risk_factors)
+alpha_bonf    <- 0.05 / n_tests
+ci_level_bonf <- 1 - alpha_bonf
+
+cat("Running models for:", paste(risk_factors, collapse = ", "), "\n")
+cat("Bootstrap samples: 5000\n")
+cat("Standard CIs: 95% BCa\n")
+cat("Bonferroni-adjusted alpha:", round(alpha_bonf, 5), "\n")
+cat("Bonferroni-adjusted CIs:", round(ci_level_bonf * 100, 2), "% BCa\n\n")
+
+all_results <- list()
+all_fit     <- list()
+
+for (rf in risk_factors) {
+  res <- fit_parallel_mediator(
+    data        = d_sem,
+    risk_factor = rf,
+    out_dir     = out_dir,
+    n_tests     = n_tests
+  )
+  all_results[[rf]] <- res$key_results
+  all_fit[[rf]]     <- res$fit_df
+}
+
+## ====================== 14. COMBINE AND SAVE INDIVIDUAL RF RESULTS ======================
+
+all_results_df <- bind_rows(all_results)
+all_fit_df     <- bind_rows(all_fit)
+
+write.csv(
+  all_results_df,
+  file.path(out_dir, "ALL_risk_factors_paths_combined.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  all_fit_df,
+  file.path(out_dir, "ALL_risk_factors_fit_indices_combined.csv"),
+  row.names = FALSE
+)
+
+## ====================== 15. SUMMARY TABLE FOR INDIVIDUAL RF ======================
+
+summary_table <- all_results_df %>%
+  dplyr::filter(Path == "Indirect: White Matter") %>%
+  dplyr::mutate(
+    CI_95   = sprintf("%.4f [%.4f, %.4f]", est, ci.lower, ci.upper),
+    CI_bonf = sprintf("%.4f [%.4f, %.4f]", est, ci.lower.bonf, ci.upper.bonf),
+    P       = signif(pvalue, 4)
+  ) %>%
+  dplyr::select(
+    Risk_Factor, N_model, Missing_handling,
+    CI_95, CI_bonf, P,
+    Significant_CI, Survives_Bonferroni
+  )
+
+cat("\n================================================================================\n")
+cat("SUMMARY: WM INDIRECT EFFECTS BY INDIVIDUAL RISK FACTOR\n")
+cat("(GMBAG retained as parallel mediator to control for GM brain ageing)\n")
+cat("Risk factors:", paste(risk_factors, collapse = ", "), "\n")
+cat("Bootstrap: 5000 samples, BCa CIs\n")
+cat("Standard CI: 95% | Bonferroni-adjusted CI:",
+    round(ci_level_bonf * 100, 2), "%\n")
+cat("================================================================================\n\n")
+print(summary_table)
+
+write.csv(
+  summary_table,
+  file.path(out_dir, "Summary_WM_indirect_by_risk_factor.csv"),
+  row.names = FALSE
+)
+
+## ====================== 16. FINISH ======================
+
+cat("\n================================================================================\n")
+cat("COMBINED ANALYSIS COMPLETE\n")
+cat("================================================================================\n\n")
+
+cat("Part 1: Primary SEM (Cardiovascular Risk)\n")
+cat("  - Primary_SEM_CV_risk_key_paths.csv\n")
+cat("  - Primary_SEM_CV_risk_fit_indices.csv\n")
+cat("  - Primary_SEM_CV_risk_lavaan_summary.txt\n")
+cat("  - Primary_SEM_CV_risk_path_diagram.png & .pdf\n\n")
+
+cat("Part 2: Individual Risk Factor Models (Hypertension, Obesity, Smoking)\n")
+cat("  - hypertension_paths.csv\n")
+cat("  - obesity_paths.csv\n")
+cat("  - smoking_paths.csv\n")
+cat("  - hypertension_fit_indices.csv\n")
+cat("  - obesity_fit_indices.csv\n")
+cat("  - smoking_fit_indices.csv\n")
+cat("  - hypertension_lavaan_summary.txt\n")
+cat("  - obesity_lavaan_summary.txt\n")
+cat("  - smoking_lavaan_summary.txt\n")
+cat("  - ALL_risk_factors_paths_combined.csv\n")
+cat("  - ALL_risk_factors_fit_indices_combined.csv\n")
+cat("  - Summary_WM_indirect_by_risk_factor.csv\n\n")
+
+cat("Column guide for output CSVs:\n")
+cat("  ci.lower / ci.upper           : standard 95% BCa CI (uncorrected)\n")
+cat("  ci.lower.bonf / ci.upper.bonf : Bonferroni-adjusted BCa CI (corrected for multiple comparisons)\n")
+cat("  Significant_CI                : 95% CI excludes zero\n")
+cat("  Survives_Bonferroni           : Bonferroni-adjusted CI excludes zero\n\n")
+
+cat("Files saved to:", out_dir, "\n")
+cat("================================================================================\n")
